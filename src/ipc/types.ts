@@ -1,5 +1,5 @@
 export type PtyOutput =
-  | { type: 'Data'; data: string } // base64-encoded
+  | { type: 'Data'; data: Uint8Array | ArrayBuffer | string }
   | {
       type: 'Exit';
       data: { exit_code: number | null; signal: string | null; last_output: string[] };

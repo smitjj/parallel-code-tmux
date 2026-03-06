@@ -12,6 +12,7 @@ import {
   countRunningAgents,
   killAllAgents,
   getAgentMeta,
+  attachAgentStream,
 } from './pty.js';
 import { ensurePlansDirectory, startPlanWatcher } from './plans.js';
 import { startRemoteServer } from '../remote/server.js';
@@ -33,7 +34,7 @@ import {
   rebaseTask,
   createWorktree,
   removeWorktree,
-} from './git.js';
+} from './git-worker-client.js';
 import { createTask, deleteTask } from './tasks.js';
 import { listAgents } from './agents.js';
 import { saveAppState, loadAppState } from './persistence.js';
@@ -74,6 +75,13 @@ export function registerAllHandlers(win: BrowserWindow): void {
   const taskNames = new Map<string, string>();
 
   // --- PTY commands ---
+  ipcMain.on(IPC.ConnectAgentStream, (event, args) => {
+    assertString(args.agentId, 'agentId');
+    const port = event.ports[0];
+    if (!port) throw new Error('Missing stream port');
+    attachAgentStream(args.agentId, port);
+  });
+
   ipcMain.handle(IPC.SpawnAgent, (_e, args) => {
     if (args.cwd) validatePath(args.cwd, 'cwd');
     if (!args.isShell && args.cwd) {
@@ -404,6 +412,8 @@ export function registerAllHandlers(win: BrowserWindow): void {
           status: meta ? ('running' as const) : ('exited' as const),
           exitCode: null,
           lastLine: '',
+          runtime: meta?.runtime,
+          runtimeSessionId: meta?.runtimeSessionId ?? null,
         };
       },
     });

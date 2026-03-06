@@ -285,13 +285,13 @@ function App() {
       }
     })();
 
-    await loadAgents();
-    await loadState();
-    await validateProjectPaths();
+    await Promise.all([loadAgents(), loadState()]);
     await restoreWindowState();
     await captureWindowState();
     setupAutosave();
     startTaskStatusPolling();
+    // Can run after first paint; doesn't gate interactive startup.
+    void validateProjectPaths();
 
     // Listen for plan content pushed from backend plan watcher
     const offPlanContent = window.electron.ipcRenderer.on(IPC.PlanContent, (data: unknown) => {

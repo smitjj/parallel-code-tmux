@@ -11,6 +11,7 @@ import {
   clearAgentActivity,
   isAgentIdle,
   rescheduleTaskStatusPolling,
+  refreshTaskStatus,
 } from './taskStatus';
 import { recordMergedLines, recordTaskCompleted } from './completion';
 import type { AgentDef, CreateTaskResult, MergeResult } from '../ipc/types';
@@ -125,6 +126,7 @@ export async function createTask(opts: CreateTaskOptions): Promise<string> {
   // Mark as busy immediately; terminal output may arrive later.
   markAgentSpawned(agentId);
   rescheduleTaskStatusPolling();
+  refreshTaskStatus(result.id);
   updateWindowTitle(name);
   return result.id;
 }
@@ -194,6 +196,7 @@ export async function createDirectTask(opts: CreateDirectTaskOptions): Promise<s
 
   markAgentSpawned(agentId);
   rescheduleTaskStatusPolling();
+  refreshTaskStatus(id);
   updateWindowTitle(name);
   return id;
 }
@@ -340,6 +343,8 @@ export async function mergeTask(
   if (cleanup) {
     // Remove task UI only when branch/worktree were cleaned up.
     removeTaskFromStore(taskId, [...agentIds, ...shellAgentIds]);
+  } else {
+    refreshTaskStatus(taskId);
   }
 }
 
@@ -354,6 +359,7 @@ export async function pushTask(taskId: string): Promise<void> {
     projectRoot,
     branchName: task.branchName,
   });
+  refreshTaskStatus(taskId);
 }
 
 export function updateTaskName(taskId: string, name: string): void {
@@ -568,6 +574,7 @@ export function uncollapseTask(taskId: string): void {
   if (agentId) {
     markAgentSpawned(agentId);
     rescheduleTaskStatusPolling();
+    refreshTaskStatus(taskId);
   }
 
   updateWindowTitle(task.name);

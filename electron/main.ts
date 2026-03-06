@@ -50,7 +50,9 @@ function verifyPreloadAllowlist(): void {
     const preloadPath = path.join(__dirname, '..', 'electron', 'preload.cjs');
     const preloadSrc = fs.readFileSync(preloadPath, 'utf8');
     const enumValues = new Set(Object.values(IPC));
-    const missing = [...enumValues].filter((v) => !preloadSrc.includes(`"${v}"`));
+    const hasChannel = (v: string) =>
+      preloadSrc.includes(`"${v}"`) || preloadSrc.includes(`'${v}'`);
+    const missing = [...enumValues].filter((v) => !hasChannel(v));
     if (missing.length > 0) {
       console.warn(
         `[preload-sync] IPC channels missing from preload.cjs ALLOWED_CHANNELS: ${missing.join(', ')}`,

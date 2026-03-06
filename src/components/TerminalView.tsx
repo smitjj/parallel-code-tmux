@@ -3,7 +3,7 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { WebLinksAddon } from '@xterm/addon-web-links';
-import { invoke, fireAndForget, Channel } from '../lib/ipc';
+import { invoke, fireAndForget, Channel, AgentStream } from '../lib/ipc';
 import { IPC } from '../../electron/ipc/channels';
 import { getTerminalFontFamily } from '../lib/fonts';
 import { getTerminalTheme } from '../lib/theme';
@@ -35,6 +35,13 @@ function base64ToUint8Array(b64: string): Uint8Array {
     if (j < out.length) out[j++] = triplet & 0xff;
   }
   return out;
+}
+
+function normalizeOutputChunk(data: Uint8Array | ArrayBuffer | string): Uint8Array {
+  if (data instanceof Uint8Array) return data;
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  // Backward-compatible fallback for pre-binary payloads.
+  return base64ToUint8Array(data);
 }
 
 interface TerminalViewProps {
@@ -164,6 +171,9 @@ export function TerminalView(props: TerminalViewProps) {
       signal: string | null;
       last_output: string[];
     } | null = null;
+    let statusRaf: number | undefined;
+    let statusQueue: Uint8Array[] = [];
+    let statusBytes = 0;
 
     function emitExit(payload: {
       exit_code: number | null;
@@ -173,6 +183,40 @@ export function TerminalView(props: TerminalViewProps) {
       if (!term) return;
       term.write('\r\n\x1b[90m[Process exited]\x1b[0m\r\n');
       props.onExit?.(payload);
+    }
+
+    function flushStatusQueue() {
+      if (statusBytes === 0) return;
+      const combined =
+        statusQueue.length === 1
+          ? statusQueue[0]
+          : (() => {
+              const out = new Uint8Array(statusBytes);
+              let off = 0;
+              for (const c of statusQueue) {
+                out.set(c, off);
+                off += c.length;
+              }
+              return out;
+            })();
+      statusQueue = [];
+      statusBytes = 0;
+
+      const payload =
+        combined.length > STATUS_ANALYSIS_MAX_BYTES
+          ? combined.subarray(combined.length - STATUS_ANALYSIS_MAX_BYTES)
+          : combined;
+      props.onData?.(payload);
+    }
+
+    function enqueueStatus(chunk: Uint8Array) {
+      statusQueue.push(chunk);
+      statusBytes += chunk.length;
+      if (statusRaf !== undefined) return;
+      statusRaf = requestAnimationFrame(() => {
+        statusRaf = undefined;
+        flushStatusQueue();
+      });
     }
 
     function flushOutputQueue() {
@@ -195,11 +239,6 @@ export function TerminalView(props: TerminalViewProps) {
         }
       }
 
-      const statusPayload =
-        payload.length > STATUS_ANALYSIS_MAX_BYTES
-          ? payload.subarray(payload.length - STATUS_ANALYSIS_MAX_BYTES)
-          : payload;
-
       outputWriteInFlight = true;
       // eslint-disable-next-line solid/reactivity -- write callback is not a reactive context
       term.write(payload, () => {
@@ -214,7 +253,7 @@ export function TerminalView(props: TerminalViewProps) {
           });
         }
 
-        props.onData?.(statusPayload);
+        enqueueStatus(payload);
         if (outputQueue.length > 0) {
           scheduleOutputFlush();
           return;
@@ -257,10 +296,11 @@ export function TerminalView(props: TerminalViewProps) {
     }
 
     const onOutput = new Channel<PtyOutput>();
+    const stream = new AgentStream<PtyOutput>(agentId);
     let initialCommandSent = false;
-    onOutput.onmessage = (msg) => {
+    const onDataMsg = (msg: PtyOutput) => {
       if (msg.type === 'Data') {
-        enqueueOutput(base64ToUint8Array(msg.data));
+        enqueueOutput(normalizeOutputChunk(msg.data));
         if (!initialCommandSent && props.initialCommand) {
           const cmd = props.initialCommand;
           initialCommandSent = true;
@@ -276,6 +316,8 @@ export function TerminalView(props: TerminalViewProps) {
         }
       }
     };
+    onOutput.onmessage = onDataMsg;
+    stream.onmessage = onDataMsg;
 
     let inputBuffer = '';
     let pendingInput = '';
@@ -359,18 +401,31 @@ export function TerminalView(props: TerminalViewProps) {
       term.options.cursorBlink = props.isFocused === true;
     });
 
-    // Load WebGL addon for all terminals. On context loss (e.g. too many
-    // WebGL contexts), the terminal gracefully falls back to the DOM renderer.
-    try {
-      webglAddon = new WebglAddon();
-      webglAddon.onContextLoss(() => {
-        webglAddon?.dispose();
-        webglAddon = undefined;
-      });
-      term.loadAddon(webglAddon);
-    } catch {
-      // WebGL2 not supported — DOM renderer used automatically
+    function enableWebgl() {
+      if (!term || webglAddon) return;
+      try {
+        webglAddon = new WebglAddon();
+        webglAddon.onContextLoss(() => {
+          webglAddon?.dispose();
+          webglAddon = undefined;
+        });
+        term.loadAddon(webglAddon);
+      } catch {
+        // WebGL2 not supported — xterm fallback renderer remains active
+      }
     }
+
+    function disableWebgl() {
+      webglAddon?.dispose();
+      webglAddon = undefined;
+    }
+
+    // Only keep GPU renderer active for focused terminals to avoid WebGL
+    // context pressure when many terminals are mounted.
+    createEffect(() => {
+      if (props.isFocused !== false) enableWebgl();
+      else disableWebgl();
+    });
 
     invoke(IPC.SpawnAgent, {
       taskId,
@@ -402,7 +457,10 @@ export function TerminalView(props: TerminalViewProps) {
       if (inputFlushTimer !== undefined) clearTimeout(inputFlushTimer);
       if (resizeFlushTimer !== undefined) clearTimeout(resizeFlushTimer);
       if (outputRaf !== undefined) cancelAnimationFrame(outputRaf);
+      if (statusRaf !== undefined) cancelAnimationFrame(statusRaf);
+      flushStatusQueue();
       onOutput.cleanup?.();
+      stream.dispose();
       webglAddon?.dispose();
       webglAddon = undefined;
       unregisterTerminal(agentId);

@@ -101,6 +101,8 @@ export function startRemoteServer(opts: {
     status: 'running' | 'exited';
     exitCode: number | null;
     lastLine: string;
+    runtime?: 'tmux' | 'pty';
+    runtimeSessionId?: string | null;
   };
 }): RemoteServer {
   const token = randomBytes(24).toString('base64url');
@@ -179,7 +181,7 @@ export function startRemoteServer(opts: {
     const fullPath = resolve(opts.staticDir, filePath.replace(/^\/+/, ''));
     const rel = relative(opts.staticDir, fullPath);
     if (rel.startsWith('..') || isAbsolute(rel)) {
-      res.writeHead(400, SECURITY_HEADERS);
+      res.writeHead(400, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain; charset=utf-8' });
       res.end('Bad request');
       return;
     }
@@ -190,7 +192,7 @@ export function startRemoteServer(opts: {
       stream.pipe(res);
       stream.on('error', () => {
         if (!res.headersSent) {
-          res.writeHead(500);
+          res.writeHead(500, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain; charset=utf-8' });
         }
         res.end();
       });
@@ -202,7 +204,7 @@ export function startRemoteServer(opts: {
         serveFile(indexPath, 'text/html', 'no-cache');
         return;
       }
-      res.writeHead(404, SECURITY_HEADERS);
+      res.writeHead(404, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain; charset=utf-8' });
       res.end('Not found');
       return;
     }
@@ -308,27 +310,21 @@ export function startRemoteServer(opts: {
 
       switch (msg.type) {
         case 'input':
-          try {
-            writeToAgent(msg.agentId, msg.data);
-          } catch {
+          void writeToAgent(msg.agentId, msg.data).catch(() => {
             /* agent gone */
-          }
+          });
           break;
 
         case 'resize':
-          try {
-            resizeAgent(msg.agentId, msg.cols, msg.rows);
-          } catch {
+          void resizeAgent(msg.agentId, msg.cols, msg.rows).catch(() => {
             /* agent gone */
-          }
+          });
           break;
 
         case 'kill':
-          try {
-            killAgent(msg.agentId);
-          } catch {
+          void killAgent(msg.agentId).catch(() => {
             /* agent gone */
-          }
+          });
           break;
 
         case 'subscribe': {

@@ -1,27 +1,58 @@
 import * as pty from 'node-pty';
-import { execFileSync } from 'child_process';
-import fs from 'fs';
-import type { BrowserWindow } from 'electron';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import type { BrowserWindow, MessagePortMain } from 'electron';
 import { RingBuffer } from '../remote/ring-buffer.js';
+import {
+  validateCommand,
+  buildSpawnEnv,
+  sanitizeSpawnCommand,
+  shellEscapeArg,
+  resolveCommandPath,
+  normalizeCwd,
+} from './terminal-common.js';
 
-interface PtySession {
+const exec = promisify(execFile);
+
+type PtyEventType = 'spawn' | 'exit' | 'list-changed';
+type PtyEventListener = (agentId: string, data?: unknown) => void;
+const eventListeners = new Map<PtyEventType, Set<PtyEventListener>>();
+
+interface MainSession {
   proc: pty.IPty;
   channelId: string;
   taskId: string;
   agentId: string;
   isShell: boolean;
-  flushTimer: ReturnType<typeof setTimeout> | null;
   subscribers: Set<(encoded: string) => void>;
   scrollback: RingBuffer;
+  cols: number;
+  runtime: 'tmux';
+  runtimeSessionId: string;
+  flushTimer: ReturnType<typeof setTimeout> | null;
+  streamPort: MessagePortMain | null;
 }
 
-const sessions = new Map<string, PtySession>();
+const sessions = new Map<string, MainSession>();
+const pendingStreamPorts = new Map<string, MessagePortMain>();
 
-// --- PTY event bus for spawn/exit notifications ---
+const BATCH_MAX = 64 * 1024;
+const BATCH_INTERVAL = 8;
+const TAIL_CAP = 8 * 1024;
+const MAX_LINES = 50;
+let tmuxPathCache: string | null = null;
 
-type PtyEventType = 'spawn' | 'exit' | 'list-changed';
-type PtyEventListener = (agentId: string, data?: unknown) => void;
-const eventListeners = new Map<PtyEventType, Set<PtyEventListener>>();
+function ensureTmuxPath(): string {
+  if (tmuxPathCache) return tmuxPathCache;
+  validateCommand('tmux');
+  tmuxPathCache = resolveCommandPath('tmux');
+  return tmuxPathCache;
+}
+
+function sessionNameFor(agentId: string): string {
+  const safe = agentId.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40);
+  return `pc_${safe || 'agent'}`;
+}
 
 /** Register a listener for PTY lifecycle events. Returns an unsubscribe function. */
 export function onPtyEvent(event: PtyEventType, listener: PtyEventListener): () => void {
@@ -45,38 +76,42 @@ export function notifyAgentListChanged(): void {
   emitPtyEvent('list-changed', '');
 }
 
-const BATCH_MAX = 64 * 1024;
-const BATCH_INTERVAL = 8; // ms
-const TAIL_CAP = 8 * 1024;
-const MAX_LINES = 50;
-
-/** Verify that a command exists in PATH. Throws a descriptive error if not found. */
-export function validateCommand(command: string): void {
-  if (!command || !command.trim()) {
-    throw new Error('Command must not be empty.');
-  }
-  // Absolute paths: check directly via filesystem
-  if (command.startsWith('/')) {
+export function attachAgentStream(agentId: string, port: MessagePortMain): void {
+  const previous = pendingStreamPorts.get(agentId);
+  if (previous && previous !== port) {
     try {
-      fs.accessSync(command, fs.constants.X_OK);
-      return;
+      previous.close();
     } catch {
-      throw new Error(
-        `Command '${command}' not found or not executable. Check that it is installed.`,
-      );
+      // ignore
     }
   }
-  // Bare names: resolve via `which` (execFileSync — no shell interpolation)
-  try {
-    execFileSync('which', [command], { encoding: 'utf8', timeout: 3000 });
-  } catch {
-    throw new Error(
-      `Command '${command}' not found in PATH. Make sure it is installed and available in your terminal.`,
-    );
+
+  const active = sessions.get(agentId);
+  if (active) {
+    try {
+      active.streamPort?.close();
+    } catch {
+      // ignore
+    }
+    active.streamPort = port;
+  } else {
+    pendingStreamPorts.set(agentId, port);
   }
+
+  port.on('close', () => {
+    const s = sessions.get(agentId);
+    if (s?.streamPort === port) s.streamPort = null;
+    if (pendingStreamPorts.get(agentId) === port) pendingStreamPorts.delete(agentId);
+  });
+  port.start();
 }
 
-export function spawnAgent(
+async function killTmuxSession(sessionId: string): Promise<void> {
+  const tmuxPath = ensureTmuxPath();
+  await exec(tmuxPath, ['kill-session', '-t', sessionId]).catch(() => {});
+}
+
+export async function spawnAgent(
   win: BrowserWindow,
   args: {
     taskId: string;
@@ -90,87 +125,67 @@ export function spawnAgent(
     isShell?: boolean;
     onOutput: { __CHANNEL_ID__: string };
   },
-): void {
+): Promise<void> {
   const channelId = args.onOutput.__CHANNEL_ID__;
   const command = args.command || process.env.SHELL || '/bin/sh';
-  const cwd = args.cwd || process.env.HOME || '/';
+  const cwd = normalizeCwd(args.cwd || process.env.HOME || '/');
+  const tmuxPath = ensureTmuxPath();
 
-  // Reject commands with shell metacharacters (node-pty uses execvp, but
-  // guard against accidental misuse). Allow bare names (resolved via PATH)
-  // and absolute paths.
-  if (/[;&|`$(){}\n]/.test(command)) {
-    throw new Error(`Command contains disallowed characters: ${command}`);
-  }
-
+  sanitizeSpawnCommand(command);
   validateCommand(command);
+  const resolvedCommand = resolveCommandPath(command);
 
-  // Kill any existing session with the same agentId to prevent PTY leaks
   const existing = sessions.get(args.agentId);
   if (existing) {
     if (existing.flushTimer) clearTimeout(existing.flushTimer);
     existing.subscribers.clear();
+    await killTmuxSession(existing.runtimeSessionId);
     existing.proc.kill();
     sessions.delete(args.agentId);
   }
 
-  const filteredEnv: Record<string, string> = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (v !== undefined) filteredEnv[k] = v;
+  const spawnEnv = buildSpawnEnv(args.env ?? {});
+  const tmuxSessionId = sessionNameFor(args.agentId);
+  const shellCmd = [resolvedCommand, ...(args.args ?? [])].map((v) => shellEscapeArg(v)).join(' ');
+
+  let proc: pty.IPty;
+  try {
+    proc = pty.spawn(
+      tmuxPath,
+      ['new-session', '-A', '-D', '-s', tmuxSessionId, '-c', cwd, shellCmd],
+      {
+        name: 'xterm-256color',
+        cols: args.cols,
+        rows: args.rows,
+        cwd,
+        env: spawnEnv,
+      },
+    );
+  } catch (err) {
+    throw new Error(`Failed to spawn tmux session '${tmuxSessionId}': ${String(err)}`);
   }
 
-  // Only allow safe env overrides from renderer. Reject vars that could
-  // alter process loading or execution behavior.
-  const ENV_BLOCK_LIST = new Set([
-    'PATH',
-    'HOME',
-    'USER',
-    'SHELL',
-    'LD_PRELOAD',
-    'LD_LIBRARY_PATH',
-    'DYLD_INSERT_LIBRARIES',
-    'NODE_OPTIONS',
-    'ELECTRON_RUN_AS_NODE',
-  ]);
-  const safeEnvOverrides: Record<string, string> = {};
-  for (const [k, v] of Object.entries(args.env ?? {})) {
-    if (!ENV_BLOCK_LIST.has(k)) safeEnvOverrides[k] = v;
-  }
-
-  const spawnEnv: Record<string, string> = {
-    ...filteredEnv,
-    TERM: 'xterm-256color',
-    COLORTERM: 'truecolor',
-    ...safeEnvOverrides,
-  };
-
-  // Clear env vars that prevent nested agent sessions
-  delete spawnEnv.CLAUDECODE;
-  delete spawnEnv.CLAUDE_CODE_SESSION;
-  delete spawnEnv.CLAUDE_CODE_ENTRYPOINT;
-
-  const proc = pty.spawn(command, args.args, {
-    name: 'xterm-256color',
-    cols: args.cols,
-    rows: args.rows,
-    cwd,
-    env: spawnEnv,
-  });
-
-  const session: PtySession = {
+  const session: MainSession = {
     proc,
     channelId,
     taskId: args.taskId,
     agentId: args.agentId,
     isShell: args.isShell ?? false,
-    flushTimer: null,
     subscribers: new Set(),
     scrollback: new RingBuffer(),
+    cols: proc.cols,
+    runtime: 'tmux',
+    runtimeSessionId: tmuxSessionId,
+    flushTimer: null,
+    streamPort: pendingStreamPorts.get(args.agentId) ?? null,
   };
+  pendingStreamPorts.delete(args.agentId);
   sessions.set(args.agentId, session);
 
-  // Batching strategy matching the Rust implementation
-  let batch = Buffer.alloc(0);
-  let tailBuf = Buffer.alloc(0);
+  let batchChunks: Buffer[] = [];
+  let batchBytes = 0;
+  const tailChunks: Buffer[] = [];
+  let tailBytes = 0;
 
   const send = (msg: unknown) => {
     if (!win.isDestroyed()) {
@@ -178,15 +193,33 @@ export function spawnAgent(
     }
   };
 
-  const flush = () => {
-    if (batch.length === 0) return;
-    const encoded = batch.toString('base64');
-    send({ type: 'Data', data: encoded });
-    session.scrollback.write(batch);
-    for (const sub of session.subscribers) {
-      sub(encoded);
+  const sendData = (chunk: Buffer) => {
+    if (session.streamPort) {
+      try {
+        const view = new Uint8Array(chunk);
+        session.streamPort.postMessage({ type: 'Data', data: view });
+        return;
+      } catch {
+        session.streamPort = null;
+      }
     }
-    batch = Buffer.alloc(0);
+    send({ type: 'Data', data: chunk });
+  };
+
+  const flush = () => {
+    if (batchBytes === 0) return;
+    const merged =
+      batchChunks.length === 1 ? batchChunks[0] : Buffer.concat(batchChunks, batchBytes);
+    sendData(merged);
+    session.scrollback.write(merged);
+    if (session.subscribers.size > 0) {
+      const encoded = merged.toString('base64');
+      for (const sub of session.subscribers) {
+        sub(encoded);
+      }
+    }
+    batchChunks = [];
+    batchBytes = 0;
     if (session.flushTimer) {
       clearTimeout(session.flushTimer);
       session.flushTimer = null;
@@ -196,41 +229,50 @@ export function spawnAgent(
   proc.onData((data: string) => {
     const chunk = Buffer.from(data, 'utf8');
 
-    // Maintain tail buffer for exit diagnostics
-    tailBuf = Buffer.concat([tailBuf, chunk]);
-    if (tailBuf.length > TAIL_CAP) {
-      tailBuf = tailBuf.subarray(tailBuf.length - TAIL_CAP);
+    tailChunks.push(chunk);
+    tailBytes += chunk.length;
+    while (tailBytes > TAIL_CAP && tailChunks.length > 0) {
+      const first = tailChunks[0];
+      if (tailBytes - first.length >= TAIL_CAP) {
+        tailChunks.shift();
+        tailBytes -= first.length;
+        continue;
+      }
+      const drop = tailBytes - TAIL_CAP;
+      tailChunks[0] = first.subarray(drop);
+      tailBytes -= drop;
+      break;
     }
 
-    batch = Buffer.concat([batch, chunk]);
+    batchChunks.push(chunk);
+    batchBytes += chunk.length;
 
-    // Flush large batches immediately
-    if (batch.length >= BATCH_MAX) {
+    if (batchBytes >= BATCH_MAX) {
       flush();
       return;
     }
 
-    // Small read = likely interactive prompt, flush immediately
     if (chunk.length < 1024) {
       flush();
       return;
     }
 
-    // Otherwise schedule flush on timer
     if (!session.flushTimer) {
       session.flushTimer = setTimeout(flush, BATCH_INTERVAL);
     }
   });
 
   proc.onExit(({ exitCode, signal }) => {
-    // If this session was replaced by a new spawn with the same agentId,
-    // skip cleanup — the new session owns the map entry now.
     if (sessions.get(args.agentId) !== session) return;
 
-    // Flush any remaining buffered data
     flush();
 
-    // Parse tail buffer into last N lines for exit diagnostics
+    const tailBuf =
+      tailChunks.length === 0
+        ? Buffer.alloc(0)
+        : tailChunks.length === 1
+          ? tailChunks[0]
+          : Buffer.concat(tailChunks, tailBytes);
     const tailStr = tailBuf.toString('utf8');
     const lines = tailStr
       .split('\n')
@@ -254,43 +296,47 @@ export function spawnAgent(
   emitPtyEvent('spawn', args.agentId);
 }
 
-export function writeToAgent(agentId: string, data: string): void {
+export async function writeToAgent(agentId: string, data: string): Promise<void> {
   const session = sessions.get(agentId);
   if (!session) throw new Error(`Agent not found: ${agentId}`);
   session.proc.write(data);
 }
 
-export function resizeAgent(agentId: string, cols: number, rows: number): void {
+export async function resizeAgent(agentId: string, cols: number, rows: number): Promise<void> {
   const session = sessions.get(agentId);
-  if (!session) throw new Error(`Agent not found: ${agentId}`);
+  if (!session) return;
+  session.cols = cols;
   session.proc.resize(cols, rows);
 }
 
-export function pauseAgent(agentId: string): void {
+export async function pauseAgent(agentId: string): Promise<void> {
   const session = sessions.get(agentId);
-  if (!session) throw new Error(`Agent not found: ${agentId}`);
+  if (!session) return;
   session.proc.pause();
 }
 
-export function resumeAgent(agentId: string): void {
+export async function resumeAgent(agentId: string): Promise<void> {
   const session = sessions.get(agentId);
-  if (!session) throw new Error(`Agent not found: ${agentId}`);
+  if (!session) return;
   session.proc.resume();
 }
 
-export function killAgent(agentId: string): void {
+export async function killAgent(agentId: string): Promise<void> {
   const session = sessions.get(agentId);
-  if (session) {
-    if (session.flushTimer) {
-      clearTimeout(session.flushTimer);
-      session.flushTimer = null;
-    }
-    // Clear subscribers before kill so the onExit flush doesn't
-    // notify stale listeners. Let onExit handle sessions.delete
-    // and emitPtyEvent to avoid the race condition.
-    session.subscribers.clear();
-    session.proc.kill();
+  if (!session) return;
+  if (session.flushTimer) {
+    clearTimeout(session.flushTimer);
+    session.flushTimer = null;
   }
+  session.subscribers.clear();
+  try {
+    session.streamPort?.close();
+  } catch {
+    // ignore
+  }
+  pendingStreamPorts.delete(agentId);
+  await killTmuxSession(session.runtimeSessionId);
+  session.proc.kill();
 }
 
 export function countRunningAgents(): number {
@@ -301,12 +347,16 @@ export function killAllAgents(): void {
   for (const [, session] of sessions) {
     if (session.flushTimer) clearTimeout(session.flushTimer);
     session.subscribers.clear();
+    try {
+      session.streamPort?.close();
+    } catch {
+      // ignore
+    }
+    void killTmuxSession(session.runtimeSessionId);
     session.proc.kill();
   }
-  // Let onExit handlers clean up sessions individually
+  pendingStreamPorts.clear();
 }
-
-// --- Subscriber helpers for remote access ---
 
 /** Subscribe to live base64-encoded output from an agent. */
 export function subscribeToAgent(agentId: string, cb: (encoded: string) => void): boolean {
@@ -332,15 +382,29 @@ export function getActiveAgentIds(): string[] {
 }
 
 /** Return metadata for a specific agent, or null if not found. */
-export function getAgentMeta(
-  agentId: string,
-): { taskId: string; agentId: string; isShell: boolean } | null {
+export function getAgentMeta(agentId: string): {
+  taskId: string;
+  agentId: string;
+  isShell: boolean;
+  runtime: 'tmux';
+  runtimeSessionId: string;
+} | null {
   const s = sessions.get(agentId);
-  return s ? { taskId: s.taskId, agentId: s.agentId, isShell: s.isShell } : null;
+  return s
+    ? {
+        taskId: s.taskId,
+        agentId: s.agentId,
+        isShell: s.isShell,
+        runtime: s.runtime,
+        runtimeSessionId: s.runtimeSessionId,
+      }
+    : null;
 }
 
 /** Return the current column width of an agent's PTY. */
 export function getAgentCols(agentId: string): number {
   const s = sessions.get(agentId);
-  return s ? s.proc.cols : 80;
+  return s ? s.cols : 80;
 }
+
+export { validateCommand };

@@ -11,6 +11,7 @@ const ALLOWED_CHANNELS = new Set([
   'pause_agent',
   'resume_agent',
   'kill_agent',
+  'connect_agent_stream',
   'count_running_agents',
   'kill_all_agents',
   'list_agents',
@@ -85,6 +86,35 @@ contextBridge.exposeInMainWorld('electron', {
     invoke: (channel, ...args) => {
       if (!isAllowedChannel(channel)) throw new Error(`Blocked IPC channel: ${channel}`);
       return ipcRenderer.invoke(channel, ...args);
+    },
+    postMessage: (channel, message, transfer) => {
+      if (!isAllowedChannel(channel)) throw new Error(`Blocked IPC channel: ${channel}`);
+      ipcRenderer.postMessage(channel, message, transfer ?? []);
+    },
+    connectAgentStream: (agentId) => {
+      if (typeof agentId !== 'string' || !agentId) throw new Error('agentId must be a string');
+      const channel = 'connect_agent_stream';
+      if (!isAllowedChannel(channel)) throw new Error(`Blocked IPC channel: ${channel}`);
+
+      const mc = new MessageChannel();
+      ipcRenderer.postMessage(channel, { agentId }, [mc.port2]);
+      mc.port1.start();
+
+      return {
+        on: (listener) => {
+          if (typeof listener !== 'function') throw new Error('listener must be a function');
+          const wrapped = (event) => listener(event.data);
+          mc.port1.addEventListener('message', wrapped);
+          return () => mc.port1.removeEventListener('message', wrapped);
+        },
+        close: () => {
+          try {
+            mc.port1.close();
+          } catch {
+            // ignore
+          }
+        },
+      };
     },
     on: (channel, listener) => {
       if (!isAllowedChannel(channel)) throw new Error(`Blocked IPC channel: ${channel}`);

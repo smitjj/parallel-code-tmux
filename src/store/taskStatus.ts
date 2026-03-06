@@ -654,28 +654,27 @@ async function refreshActiveTaskGitStatus(): Promise<void> {
 
 /** Refresh git status for a single task (e.g. after agent exits). */
 export function refreshTaskStatus(taskId: string): void {
-  refreshTaskGitStatus(taskId);
+  const existing = pendingTaskRefreshes.get(taskId);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(() => {
+    pendingTaskRefreshes.delete(taskId);
+    void refreshTaskGitStatus(taskId);
+  }, 250);
+  pendingTaskRefreshes.set(taskId, timer);
 }
 
 let allTasksTimer: ReturnType<typeof setInterval> | null = null;
-let activeTaskTimer: ReturnType<typeof setInterval> | null = null;
+const pendingTaskRefreshes = new Map<string, ReturnType<typeof setTimeout>>();
 let lastPollingTaskCount = 0;
-
-function computeAllTasksInterval(): number {
-  const taskCount = store.taskOrder.length;
-  return Math.min(120_000, 30_000 + Math.max(0, taskCount - 3) * 5_000);
-}
+const FALLBACK_SWEEP_MS = 120_000;
 
 export function startTaskStatusPolling(): void {
-  if (allTasksTimer || activeTaskTimer) return;
-  // Active task polls every 5s for responsive UI
-  activeTaskTimer = setInterval(refreshActiveTaskGitStatus, 5_000);
-  // Scale interval: 30s base + 5s per additional task beyond 3
+  if (allTasksTimer) return;
+  // Event-driven updates are primary; this is a slow reconciliation sweep.
   lastPollingTaskCount = store.taskOrder.length;
-  allTasksTimer = setInterval(refreshAllTaskGitStatus, computeAllTasksInterval());
-  // Run once immediately
-  refreshActiveTaskGitStatus();
-  refreshAllTaskGitStatus();
+  allTasksTimer = setInterval(refreshAllTaskGitStatus, FALLBACK_SWEEP_MS);
+  void refreshActiveTaskGitStatus();
+  void refreshAllTaskGitStatus();
 }
 
 /** Call when tasks are added/removed to recalculate the all-tasks polling interval. */
@@ -684,8 +683,8 @@ export function rescheduleTaskStatusPolling(): void {
   const currentCount = store.taskOrder.length;
   if (currentCount === lastPollingTaskCount) return;
   lastPollingTaskCount = currentCount;
-  clearInterval(allTasksTimer);
-  allTasksTimer = setInterval(refreshAllTaskGitStatus, computeAllTasksInterval());
+  // Refresh quickly when task set changes; keep one global slow fallback timer.
+  void refreshAllTaskGitStatus();
 }
 
 export function stopTaskStatusPolling(): void {
@@ -693,9 +692,9 @@ export function stopTaskStatusPolling(): void {
     clearInterval(allTasksTimer);
     allTasksTimer = null;
   }
-  if (activeTaskTimer) {
-    clearInterval(activeTaskTimer);
-    activeTaskTimer = null;
+  for (const timer of pendingTaskRefreshes.values()) {
+    clearTimeout(timer);
   }
+  pendingTaskRefreshes.clear();
   lastPollingTaskCount = 0;
 }
